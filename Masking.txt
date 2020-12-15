@@ -1,0 +1,110 @@
+    Private Sub MaskPrompts()
+        Dim configPath As String = System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly.Location()) & "\ImportData.exe.config"
+        Dim config As XmlDocument = New XmlDocument()
+        Dim template As String = "select pmntcode_id, pmsubcode_id from pmnt where pmnt_name like '{0}';"
+        Dim selectTemplate As String = "select * from tillpmnt_prompt where sernum_tillpmnt in (select sernum from tillpmnt where pmcode = {0} and pmsubcode = {1}) and prompt_name = '{2}' and sernum_tillpmnt > {3};"
+        Dim update As String = "update tillpmnt_prompt set prompt_response = 'MASKED' where sernum_tillpmnt in (select sernum from tillpmnt where pmcode = {0} and pmsubcode = {1}) and prompt_name = '{2}' and sernum_tillpmnt > {3};"
+        Dim partialMask As String = "update tillpmnt_prompt set prompt_response = {0} where sernum_tillpmnt in (select sernum from tillpmnt where pmcode = {1} and pmsubcode = {2}) and prompt_name = '{3}' and sernum_tillpmnt > {4};"
+        Dim maxSeq As String = "select max(sernum) from tillpmnt where pmcode = {0} and pmsubcode = {1};"
+        Dim pmntcode_id, pmsubcode_id As String
+        Dim line, result As String
+        Dim cardname As String
+        Dim prompt As String
+        Dim minSequence, maxSequence As String
+        Dim writer As StreamWriter
+        Dim reader As StreamReader
+
+        mLogger = New LogWriter(ScriptLog)
+        mLogger.Log(" Script ImportData masking started", 1)
+
+        Try
+            File.Delete("C:\Pilot\QueryResult.txt")
+            config.Load(configPath)
+            For Each node As XmlNode In config.SelectNodes("/configuration/userSettings/ImportData.My.MySettings/setting")
+                cardname = node.Attributes("name").InnerText
+                mLogger.Log(" Getting payment data for " & cardname, 2)
+                prompt = node.ChildNodes(0).InnerText
+                writer = New StreamWriter(New FileStream("C:\Pilot\CodeQuery.sql", FileMode.Create, FileAccess.Write))
+                writer.WriteLine(String.Format(template, cardname))
+                writer.Close()
+
+                ' results should be obtained in less than 1 second, but allow 10 seconds
+                ' a blank file will cause the masking to be skipped
+                Shell(ISQLExe & OfficeDB & " -i c:\pilot\CodeQuery.sql -m -o c:\pilot\QueryResult.txt -e -u sysdba -p masterkey", AppWinStyle.Hide, True, 10000)
+
+                result = ""
+                line = ""
+                minSequence = "0"
+                reader = New StreamReader(New FileStream("C:\Pilot\QueryResult.txt", FileMode.Open, FileAccess.Read))
+                While Not reader.EndOfStream()
+                    line = reader.ReadLine().Trim()
+                    If line <> "" Then
+                        result = line
+                    End If
+                End While
+                reader.Close()
+
+                Try
+                    File.Delete("C:\Pilot\QueryResult.txt")
+                Catch ex As Exception
+                    Exit Sub
+                End Try
+
+                If result <> "" Then
+                    pmntcode_id = result.Substring(0, 5).Trim()
+                    pmsubcode_id = result.Substring(6).Trim()
+                    If IsNumeric(pmntcode_id) Then
+
+                        mLogger.Log(String.Format("  Getting max(sernum) from tillpmnt where pmcode = {0} and pmsubcode = {1}", pmntcode_id, pmsubcode_id), 4)
+                        writer = New StreamWriter(New FileStream("C:\Pilot\CodeQuery.sql", FileMode.Create, FileAccess.Write))
+                        writer.WriteLine(String.Format(maxSeq, pmntcode_id, pmsubcode_id))
+                        writer.Close()
+
+                        Shell(ISQLExe & OfficeDB & " -i c:\pilot\CodeQuery.sql -m -o c:\pilot\MaxQueryResult.txt -e -u sysdba -p masterkey", AppWinStyle.Hide, True)
+
+                        reader = New StreamReader(New FileStream("C:\Pilot\MaxQueryResult.txt", FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        While Not reader.EndOfStream()
+                            line = reader.ReadLine().Trim()
+                            If line <> "" Then
+                                result = line
+                            End If
+                        End While
+                        reader.Close()
+                        File.Delete("C:\Pilot\MaxQueryResult.txt")
+
+                        maxSequence = result.Trim()
+                        mLogger.Log(String.Format("   MaxQueryResult = '{0}'", maxSequence), 3)
+
+                        If maxSequence <> "" AndAlso maxSequence <> "<null>" Then
+                            If RegistryFunction("HKLM", "Software\PilotInfo\ImportData", String.Format("{0}_{1}", cardname.Trim(), prompt), True, minSequence) Then
+                                mLogger.Log(String.Format("  Masking {0} prompt for {1}", prompt, cardname), 2)
+
+                                writer = New StreamWriter(New FileStream("C:\Pilot\CodeQuery.sql", FileMode.Create, FileAccess.Write))
+                                writer.WriteLine(String.Format(update, pmntcode_id, pmsubcode_id, prompt, minSequence))
+                                writer.Close()
+
+                                Shell(ISQLExe & OfficeDB & " -i c:\pilot\CodeQuery.sql -m -e -u sysdba -p masterkey", AppWinStyle.Hide, True)
+
+                                mLogger.Log("   Done", 3)
+                                RegistryFunction("HKLM", "Software\PilotInfo\ImportData", String.Format("{0}_{1}", cardname.Trim(), prompt), False, maxSequence)
+                                Sleep(2000)
+                            End If
+
+                        End If
+                    Else
+                        mLogger.Log(String.Format("   -- Tender {0} not found", cardname), 4)
+                    End If
+                Else
+
+                End If
+
+            Next
+            File.Delete("C:\Pilot\PostUpdate.txt")
+            File.Delete("C:\Pilot\CodeQuery.sql")
+        Catch ex As Exception
+            mLogger.Log(" ERROR: " & ex.Message, 1)
+        End Try
+        mLogger.Log(" ImportData masking done", 1)
+        mLogger.Log(SEPARATOR, 1)
+        mLogger.Close()
+    End Sub
